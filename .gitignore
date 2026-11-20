@@ -11,3 +11,6 @@ build/
 .pytest_cache/
 data/*.jsonl
 !data/.gitkeep
+*.db
+*.db-wal
+*.db-shm
