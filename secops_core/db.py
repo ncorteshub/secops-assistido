@@ -106,7 +106,11 @@ class SecOpsRepository:
                 rec["event_id"],
                 rec["timestamp"] if isinstance(rec["timestamp"], str) else str(rec["timestamp"]),
                 rec.get("source_ip"),
-                rec.get("user_identity"),
+                (
+                    dumps(rec["user_identity"], default=str)
+                    if isinstance(rec.get("user_identity"), dict)
+                    else rec.get("user_identity")
+                ),
                 rec.get("event_name"),
                 rec.get("event_source"),
                 rec.get("aws_region"),
