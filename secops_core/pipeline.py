@@ -279,6 +279,7 @@ class HybridSecOpsPipeline:
         parsed = processor.parse_file()
         canonical_logs = (
             parsed
+            or getattr(processor, "parsed_logs", None)
             or getattr(processor, "valid_logs", None)
             or getattr(processor, "logs", None)
             or getattr(processor, "records", None)
