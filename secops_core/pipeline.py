@@ -275,19 +275,19 @@ class HybridSecOpsPipeline:
         if not path.exists():
             raise FileNotFoundError(f"Arquivo de logs não encontrado: {input_path}")
 
-        # Executa o LGMSProcessor para validação oficial do arquivo
         processor = LGMSProcessor(str(path))
-        processor.parse_file()
-
-        # Carrega e normaliza os registros do JSONL via CanonicalLog
-        events: List[Dict[str, Any]] = []
-        with path.open("r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if line:
-                    raw = json.loads(line)
-                    events.append(self._normalize_event(raw))
-
+        parsed = processor.parse_file()
+        canonical_logs = (
+            parsed
+            or getattr(processor, "valid_logs", None)
+            or getattr(processor, "logs", None)
+            or getattr(processor, "records", None)
+            or []
+        )
+        events = [
+            log.model_dump(mode="json") if hasattr(log, "model_dump") else dict(log)
+            for log in canonical_logs
+        ]
         return self.run_events(events, persist=persist)
 
 
