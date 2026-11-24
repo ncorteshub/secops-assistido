@@ -188,17 +188,44 @@ class AlertExplanationRenderer:
     def render(
         self,
         data: Union[DetectionResult, AlertExplanationContext, Dict[str, Any], None] = None,
+        template_name: Optional[str] = None,
         **kwargs: Any,
     ) -> str:
-        """Renderiza o template alert_explanation.j2 sem qualquer concatenação hardcoded em Python."""
+        """Renderiza o template especificado (ou alert_explanation.j2) sem qualquer concatenação hardcoded em Python."""
         context = self.build_context(data, **kwargs)
-        return self.template.render(context)
+        tpl = self.env.get_template(template_name) if template_name else self.template
+        return tpl.render(context)
+
+    def render_prompt(
+        self,
+        data: Union[DetectionResult, AlertExplanationContext, Dict[str, Any], None] = None,
+        **kwargs: Any,
+    ) -> str:
+        """Renderiza o prompt contextualizado otimizado para envio ao LLM local."""
+        return self.render(data, template_name="alert_explanation.j2", **kwargs)
+
+    def render_fallback(
+        self,
+        data: Union[DetectionResult, AlertExplanationContext, Dict[str, Any], None] = None,
+        **kwargs: Any,
+    ) -> str:
+        """Renderiza a explicação de fallback determinística quando o LLM estiver offline ou falhar."""
+        return self.render(data, template_name="fallback_explanation.j2", **kwargs)
 
 
 def render_alert_explanation(
     data: Union[DetectionResult, AlertExplanationContext, Dict[str, Any], None] = None,
     **kwargs: Any,
 ) -> str:
-    """Função de conveniência para renderizar o template de explicação de alertas SecOps."""
+    """Função de conveniência para renderizar o prompt de explicação de alertas SecOps."""
     renderer = AlertExplanationRenderer()
-    return renderer.render(data, **kwargs)
+    return renderer.render_prompt(data, **kwargs)
+
+
+def render_fallback_explanation(
+    data: Union[DetectionResult, AlertExplanationContext, Dict[str, Any], None] = None,
+    **kwargs: Any,
+) -> str:
+    """Função de conveniência para renderizar a explicação determinística de fallback."""
+    renderer = AlertExplanationRenderer()
+    return renderer.render_fallback(data, **kwargs)

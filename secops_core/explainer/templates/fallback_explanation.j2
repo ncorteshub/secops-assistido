@@ -1,0 +1,49 @@
+### 1) O que aconteceu (Resumo Simples)
+O evento {% if event_name %}'{{ event_name }}'{% else %}de segurança{% endif %}{% if event_source %} no serviço '{{ event_source }}'{% endif %} foi registrado{% if timestamp %} em {{ timestamp }}{% endif %}{% if user %} associado à identidade '{{ user }}'{% endif %}{% if source_ip %} a partir do IP {{ source_ip }}{% endif %}. O alerta foi consolidado com nível de severidade {{ severity }}.
+
+### 2) Por que foi considerado anômalo
+O evento acionou os seguintes indicadores e detectores de segurança:
+{%- if zscore is not none %}
+- Desvio Estatístico (Z-Score): O valor {{ zscore }} reflete uma anomalia estatística volumétrica ou de frequência atípica.
+{%- endif %}
+{%- if iforest_score is not none %}
+- Anomalia Comportamental (Isolation Forest): Score de {{ iforest_score }} indica desvio multivariado significativo da linha de base de eventos legítimos.
+{%- endif %}
+{%- if cloudtrail_rules %}
+- Violação de Regras Determinísticas CloudTrail:
+{%- for rule in cloudtrail_rules %}
+  * {%- if rule is mapping %} [{{ rule.get('rule_code', 'REGRA') }}] {{ rule.get('name', '') }}{% if rule.get('technical_reason') %}: {{ rule.get('technical_reason') }}{% endif %}
+    {%- elif rule.rule_code is defined %} [{{ rule.rule_code }}] {{ rule.name }}{% if rule.technical_reason %}: {{ rule.technical_reason }}{% endif %}
+    {%- else %} {{ rule }}
+    {%- endif %}
+{%- endfor %}
+{%- endif %}
+{%- if technical_justification %}
+- Justificativa Consolidada: {{ technical_justification }}
+{%- endif %}
+{%- if zscore is none and iforest_score is none and not cloudtrail_rules and not technical_justification %}
+- Sinalização preventiva operacional com base no nível de severidade {{ severity }}.
+{%- endif %}
+
+### 3) Risco Potencial
+{%- if severity == 'CRITICAL' %}
+Risco Crítico à segurança da infraestrutura em nuvem, envolvendo possível comprometimento de credenciais privilegiadas, desativação de auditoria ou ação não autorizada de alto impacto destrutivo.
+{%- elif severity == 'HIGH' %}
+Risco Alto de escalada de privilégios, exposição indevida de dados sensíveis ou violação deliberada de controles de segurança.
+{%- elif severity == 'MEDIUM' %}
+Risco Moderado de anomalia operacional ou sondagem preliminar de ambiente que demanda validação de conformidade.
+{%- else %}
+Risco Baixo ou desvio comportamental sem indício confirmado de atividade maliciosa ativa.
+{%- endif %}
+
+### 4) Ação Recomendada
+{%- if severity in ['CRITICAL', 'HIGH'] %}
+1. Isolar preventivamente as credenciais ou papéis IAM associados à identidade '{% if user %}{{ user }}{% else %}suspeita{% endif %}'.
+2. Bloquear requisições provenientes do IP '{% if source_ip %}{{ source_ip }}{% else %}de origem{% endif %}' no firewall / security group.
+3. Inspecionar os logs do CloudTrail no intervalo do evento para identificar movimentações laterais ou persistência.
+4. Notificar a equipe de Resposta a Incidentes (IR) para contenção e análise forense imediata.
+{%- else %}
+1. Validar a legitimidade da atividade diretamente com o proprietário da identidade '{% if user %}{{ user }}{% else %}envolvida{% endif %}'.
+2. Monitorar o IP '{% if source_ip %}{{ source_ip }}{% else %}de origem{% endif %}' nas próximas 24 horas para verificar reincidência de anomalias.
+3. Caso a operação seja justificada operacionalmente, arquivar o alerta e ajustar a linha de base dos detectores.
+{%- endif %}

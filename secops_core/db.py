@@ -68,6 +68,12 @@ class SecOpsRepository:
             for index_sql in create_indexes_sql:
                 conn.execute(index_sql)
 
+            # Garante migração de schema caso a coluna ai_explanation não exista
+            cursor = conn.execute("PRAGMA table_info(security_alerts);")
+            columns = [row["name"] for row in cursor.fetchall()]
+            if "ai_explanation" not in columns:
+                conn.execute("ALTER TABLE security_alerts ADD COLUMN ai_explanation TEXT;")
+
     def bulk_insert(self, records: List[Dict[str, Any]]) -> int:
         """
         Insere múltiplos eventos processados em uma única transação em < 100ms.
@@ -143,6 +149,22 @@ class SecOpsRepository:
         with self._get_connection() as conn:
             cursor = conn.executemany(insert_sql, rows_to_insert)
             return cursor.rowcount
+
+    def get_alert_by_id(self, event_id: str) -> Optional[Dict[str, Any]]:
+        """Busca um alerta específico pelo event_id com deserialização automática."""
+        query_sql = "SELECT * FROM security_alerts WHERE event_id = ? LIMIT 1;"
+        with self._get_connection() as conn:
+            row = conn.execute(query_sql, (event_id,)).fetchone()
+            if row is None:
+                return None
+            item = dict(row)
+            item["is_zscore_anomaly"] = bool(item["is_zscore_anomaly"])
+            item["is_iforest_anomaly"] = bool(item["is_iforest_anomaly"])
+            item["is_anomaly"] = bool(item["is_anomaly"])
+            item["cloudtrail_rules_triggered"] = json.loads(
+                item["cloudtrail_rules_triggered"] or "[]"
+            )
+            return item
 
     def update_ai_explanation(self, event_id: str, explanation: str) -> bool:
         """Atualiza a explicação gerada pela IA para um alerta específico."""
