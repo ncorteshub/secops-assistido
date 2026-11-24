@@ -1,17 +1,24 @@
 import os
+import time
+from pathlib import Path
 from typing import Optional
 
-from fastapi import Depends, FastAPI, HTTPException, Query, status
+from fastapi import Body, Depends, FastAPI, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
 
 from api.schemas import (
     AnomalyDetailResponse,
+    ExplainResponse,
     HealthResponse,
     LogsListResponse,
+    PipelineRunRequest,
+    PipelineRunResponse,
     StatsResponse,
 )
 from secops_core.db import SecOpsRepository
 from secops_core.explainer.ollama_client import OllamaExplainerClient
+from secops_core.generator import generate_logs
+from secops_core.pipeline import HybridSecOpsPipeline
 
 
 def get_repository() -> SecOpsRepository:
@@ -25,6 +32,11 @@ def get_ollama_client() -> OllamaExplainerClient:
     base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
     model = os.getenv("OLLAMA_MODEL", "llama3.2")
     return OllamaExplainerClient(base_url=base_url, model=model)
+
+
+def get_logs_path() -> str:
+    """Provedor injetável do caminho para o arquivo JSONL de logs simulados."""
+    return os.getenv("SECOPS_LOGS_PATH", "data/logs_simulados.jsonl")
 
 
 app = FastAPI(
@@ -172,3 +184,104 @@ def get_anomaly_detail(
             detail=f"Alerta ou evento com ID '{event_id}' não encontrado.",
         )
     return AnomalyDetailResponse(**alert)
+
+
+def _resolve_explanation_source(ollama_client: OllamaExplainerClient) -> str:
+    """Determina a origem da explicação ('ollama' ou 'fallback') após a geração."""
+    last_source = getattr(ollama_client, "last_source", None)
+    if last_source in {"ollama", "fallback"}:
+        return last_source
+    return "ollama" if ollama_client.healthcheck() else "fallback"
+
+
+@app.post(
+    "/pipeline/run",
+    response_model=PipelineRunResponse,
+    summary="Executa o pipeline completo de detecção sob demanda",
+    tags=["Pipeline"],
+)
+def run_pipeline(
+    request: PipelineRunRequest = Body(default_factory=PipelineRunRequest),
+    repo: SecOpsRepository = Depends(get_repository),
+    ollama_client: OllamaExplainerClient = Depends(get_ollama_client),
+    logs_path: str = Depends(get_logs_path),
+) -> PipelineRunResponse:
+    """Regenera logs (opcional), executa o pipeline híbrido, persiste no SQLite e gera explicações opcionais."""
+    start_time = time.perf_counter()
+
+    if request.regenerate_logs:
+        Path(logs_path).parent.mkdir(parents=True, exist_ok=True)
+        generate_logs(num_records=request.num_logs, output_file=logs_path)
+
+    pipeline = HybridSecOpsPipeline(db_path=str(repo.db_path), repository=repo)
+    try:
+        results = pipeline.run_from_jsonl(logs_path, persist=True)
+    except FileNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(exc),
+        ) from exc
+
+    anomalies = [result for result in results if result.is_anomaly]
+    explanations_generated = 0
+
+    if request.generate_explanations and anomalies:
+        for anomaly in anomalies[: request.max_explanations]:
+            explanation = ollama_client.generate_explanation(
+                data=anomaly,
+                event_id=anomaly.event_id,
+                persist=False,
+            )
+            repo.update_ai_explanation(anomaly.event_id, explanation)
+            explanations_generated += 1
+
+    elapsed = round(time.perf_counter() - start_time, 4)
+    return PipelineRunResponse(
+        status="ok",
+        logs_regenerated=request.regenerate_logs,
+        records_processed=len(results),
+        anomalies_detected=len(anomalies),
+        explanations_generated=explanations_generated,
+        execution_time_seconds=elapsed,
+    )
+
+
+@app.post(
+    "/anomalies/{event_id}/explain",
+    response_model=ExplainResponse,
+    summary="Gera ou regenera a explicação IA para um alerta específico",
+    tags=["Anomalies"],
+)
+def explain_anomaly(
+    event_id: str,
+    repo: SecOpsRepository = Depends(get_repository),
+    ollama_client: OllamaExplainerClient = Depends(get_ollama_client),
+) -> ExplainResponse:
+    """Gera explicação via Ollama (ou fallback Jinja2), persiste em ai_explanation e retorna o resultado."""
+    alert = repo.get_alert_by_id(event_id)
+    if not alert:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Alerta ou evento com ID '{event_id}' não encontrado.",
+        )
+
+    alert_context = dict(alert)
+    raw_json = alert_context.get("raw_normalized_json")
+    if isinstance(raw_json, dict) and not alert_context.get("technical_justification"):
+        justification = raw_json.get("technical_justification") or raw_json.get("anomaly_reason")
+        if justification:
+            alert_context["technical_justification"] = justification
+
+    explanation = ollama_client.generate_explanation(
+        data=alert_context,
+        event_id=event_id,
+        persist=False,
+    )
+    repo.update_ai_explanation(event_id, explanation)
+    source = _resolve_explanation_source(ollama_client)
+
+    return ExplainResponse(
+        event_id=event_id,
+        ai_explanation=explanation,
+        source=source,
+    )

@@ -38,6 +38,7 @@ class OllamaExplainerClient:
         self.healthcheck_timeout = float(healthcheck_timeout)
         self.renderer = renderer or AlertExplanationRenderer()
         self.repository = repository
+        self.last_source: Optional[str] = None
 
     def healthcheck(self) -> bool:
         """
@@ -130,15 +131,21 @@ class OllamaExplainerClient:
         prompt = self.renderer.render_prompt(data, **kwargs)
 
         explanation: Optional[str] = None
+        source = "fallback"
 
         # Tenta inferência via Ollama apenas se o servidor estiver ativo
         if self.healthcheck():
             explanation = self._call_ollama(prompt)
+            if explanation:
+                source = "ollama"
 
         # Fallback determinístico e estruturado via Jinja2 caso o Ollama esteja offline ou falhe
         if not explanation:
             logger.info("Acionando fallback determinístico Jinja2 para o alerta %s", target_event_id or "desconhecido")
             explanation = self.renderer.render_fallback(data, **kwargs)
+            source = "fallback"
+
+        self.last_source = source
 
         # Persistência no SQLite
         if target_event_id and (persist or self.repository is not None):

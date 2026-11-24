@@ -1,4 +1,4 @@
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Literal, Optional, Union
 from pydantic import BaseModel, Field
 
 
@@ -91,4 +91,50 @@ class AnomalyDetailResponse(LogItem):
 
     raw_normalized_json: Optional[Union[Dict[str, Any], str]] = Field(
         default=None, description="Payload completo e normalizado do evento no padrão canônico LGMS"
+    )
+
+
+class PipelineRunRequest(BaseModel):
+    """Parâmetros opcionais para execução sob demanda do pipeline SecOps."""
+
+    regenerate_logs: bool = Field(
+        default=False,
+        description="Se True, regenera o arquivo logs_simulados.jsonl antes de executar o pipeline",
+    )
+    num_logs: int = Field(
+        default=100,
+        ge=10,
+        le=2000,
+        description="Quantidade de logs simulados a gerar quando regenerate_logs=True (10 a 2000)",
+    )
+    generate_explanations: bool = Field(
+        default=False,
+        description="Se True, gera explicações IA para as anomalias detectadas",
+    )
+    max_explanations: int = Field(
+        default=10,
+        ge=1,
+        le=50,
+        description="Limite máximo de explicações geradas em uma única execução (1 a 50)",
+    )
+
+
+class PipelineRunResponse(BaseModel):
+    """Sumário da execução sob demanda do pipeline de detecção."""
+
+    status: str = Field(default="ok", description="Status da execução do pipeline")
+    logs_regenerated: bool = Field(..., description="Indica se os logs simulados foram regenerados")
+    records_processed: int = Field(..., description="Total de eventos processados pelo pipeline")
+    anomalies_detected: int = Field(..., description="Quantidade de anomalias detectadas")
+    explanations_generated: int = Field(..., description="Quantidade de explicações geradas e persistidas")
+    execution_time_seconds: float = Field(..., description="Tempo total de execução em segundos")
+
+
+class ExplainResponse(BaseModel):
+    """Resposta da geração ou regeneração de explicação IA para um alerta específico."""
+
+    event_id: str = Field(..., description="Identificador único do evento explicado")
+    ai_explanation: str = Field(..., description="Explicação contextualizada gerada via Ollama ou fallback")
+    source: Literal["ollama", "fallback"] = Field(
+        ..., description="Origem da explicação gerada ('ollama' ou 'fallback')"
     )
