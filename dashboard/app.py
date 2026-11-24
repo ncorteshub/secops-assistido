@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import html
+import ipaddress
+import json
 import os
+import re
 from typing import Any, Dict, List, Optional
 
 import httpx
@@ -25,6 +29,33 @@ DETECTOR_COLORS = {
     "Isolation Forest": "#8B5CF6",
     "CloudTrail Rules": "#F59E0B",
 }
+DETECTOR_FILTER_MAP = {
+    "Todos": None,
+    "Z-Score": "statistical",
+    "Isolation Forest": "ml",
+    "CloudTrail Rules": "rule",
+}
+
+_SENSITIVE_KEY_TOKENS = (
+    "password",
+    "passwd",
+    "secret",
+    "token",
+    "api_key",
+    "apikey",
+    "private_key",
+    "access_key",
+    "credential",
+    "authorization",
+    "cookie",
+    "file_path",
+    "local_path",
+    "db_path",
+    "logs_path",
+)
+_LOCAL_PATH_RE = re.compile(
+    r"^(?:[A-Za-z]:[\\/]|\\\\[^\\]+|/(?:home|Users|root|tmp|var|etc|opt|mnt|srv|usr|app)/)"
+)
 
 
 def get_api_base_url() -> str:
@@ -56,6 +87,90 @@ def fetch_logs(api_base_url: str, limit: int = 500, offset: int = 0) -> Dict[str
     """Consulta GET /logs na FastAPI."""
     with httpx.Client(base_url=api_base_url, timeout=10.0) as client:
         response = client.get("/logs", params={"limit": limit, "offset": offset})
+        response.raise_for_status()
+        return response.json()
+
+
+def _looks_like_ip(value: str) -> bool:
+    """Retorna True se o texto informado representar um endereço IPv4 ou IPv6."""
+    try:
+        ipaddress.ip_address(value.strip())
+        return True
+    except ValueError:
+        return False
+
+
+def build_anomaly_filter_params(
+    severity: Optional[str] = None,
+    detector_label: Optional[str] = None,
+    event_name: Optional[str] = None,
+    user_or_ip: Optional[str] = None,
+    limit: int = 200,
+    offset: int = 0,
+) -> Dict[str, Any]:
+    """Constrói os query params para consulta filtrada de anomalias em GET /logs."""
+    params: Dict[str, Any] = {
+        "is_anomaly": True,
+        "limit": int(limit),
+        "offset": int(offset),
+    }
+    if severity and severity != "Todas":
+        params["severity"] = severity.strip().upper()
+    if detector_label and detector_label != "Todos":
+        mapped = DETECTOR_FILTER_MAP.get(detector_label)
+        if mapped:
+            params["detector_type"] = mapped
+        elif detector_label in {"statistical", "ml", "rule", "hybrid"}:
+            params["detector_type"] = detector_label
+    if event_name and event_name.strip():
+        params["event_name"] = event_name.strip()
+    if user_or_ip and user_or_ip.strip():
+        cleaned = user_or_ip.strip()
+        if _looks_like_ip(cleaned):
+            params["source_ip"] = cleaned
+        else:
+            params["user"] = cleaned
+    return params
+
+
+@st.cache_data(ttl=10)
+def fetch_filtered_anomalies(
+    api_base_url: str,
+    severity: Optional[str] = None,
+    detector_label: Optional[str] = None,
+    event_name: Optional[str] = None,
+    user_or_ip: Optional[str] = None,
+    limit: int = 200,
+    offset: int = 0,
+) -> Dict[str, Any]:
+    """Consulta GET /logs?is_anomaly=true com filtros combináveis na FastAPI."""
+    params = build_anomaly_filter_params(
+        severity=severity,
+        detector_label=detector_label,
+        event_name=event_name,
+        user_or_ip=user_or_ip,
+        limit=limit,
+        offset=offset,
+    )
+    with httpx.Client(base_url=api_base_url, timeout=10.0) as client:
+        response = client.get("/logs", params=params)
+        response.raise_for_status()
+        return response.json()
+
+
+@st.cache_data(ttl=10)
+def fetch_anomaly_detail(api_base_url: str, event_id: str) -> Dict[str, Any]:
+    """Consulta GET /anomalies/{event_id} para detalhes completos do alerta."""
+    with httpx.Client(base_url=api_base_url, timeout=10.0) as client:
+        response = client.get(f"/anomalies/{event_id}")
+        response.raise_for_status()
+        return response.json()
+
+
+def trigger_anomaly_explanation(api_base_url: str, event_id: str) -> Dict[str, Any]:
+    """Dispara POST /anomalies/{event_id}/explain para gerar ou regenerar a explicação IA."""
+    with httpx.Client(base_url=api_base_url, timeout=60.0) as client:
+        response = client.post(f"/anomalies/{event_id}/explain")
         response.raise_for_status()
         return response.json()
 
@@ -245,6 +360,105 @@ def prepare_top_suspects(
         "source_ips": _top_counts(source_ips, top_n),
         "users": _top_counts(users, top_n),
     }
+
+
+def _format_detectors_label(item: Dict[str, Any]) -> str:
+    """Formata os detectores disparados para exibição tabular."""
+    detectors: List[str] = []
+    if item.get("is_zscore_anomaly"):
+        detectors.append("Z-Score")
+    if item.get("is_iforest_anomaly"):
+        detectors.append("Isolation Forest")
+    if item.get("cloudtrail_rules_triggered"):
+        detectors.append("CloudTrail Rules")
+    return ", ".join(detectors) if detectors else "Nenhum"
+
+
+def _summarize_explanation_status(explanation: Any, max_len: int = 70) -> str:
+    """Resume o status e prévia da explicação IA para a tabela de alertas."""
+    if not isinstance(explanation, str) or not explanation.strip():
+        return "Pendente"
+    cleaned = " ".join(explanation.replace("#", "").replace("*", "").split())
+    if len(cleaned) > max_len:
+        cleaned = f"{cleaned[: max_len - 3].rstrip()}..."
+    return f"Gerada — {cleaned}"
+
+
+def prepare_anomalies_table_df(anomalies: List[Dict[str, Any]]) -> pd.DataFrame:
+    """Prepara DataFrame limpo com as colunas principais dos alertas filtrados."""
+    columns = [
+        "Horário (UTC)",
+        "Severidade",
+        "Evento",
+        "Usuário",
+        "IP de Origem",
+        "Detector",
+        "Explicação IA",
+    ]
+    if not anomalies:
+        return pd.DataFrame(columns=columns)
+
+    rows = [
+        {
+            "Horário (UTC)": str(item.get("timestamp") or "-"),
+            "Severidade": str(item.get("final_severity") or "LOW").upper(),
+            "Evento": str(item.get("event_name") or "Desconhecido"),
+            "Usuário": extract_user_label(item.get("user_identity")),
+            "IP de Origem": str(item.get("source_ip") or "Desconhecido"),
+            "Detector": _format_detectors_label(item),
+            "Explicação IA": _summarize_explanation_status(item.get("ai_explanation")),
+        }
+        for item in anomalies
+    ]
+    return pd.DataFrame(rows, columns=columns)
+
+
+def format_anomaly_option(item: Dict[str, Any]) -> str:
+    """Formata um item de anomalia para exibição no seletor de investigação."""
+    severity = str(item.get("final_severity") or "LOW").upper()
+    event_name = str(item.get("event_name") or "Desconhecido")
+    user = extract_user_label(item.get("user_identity"))
+    event_id = str(item.get("event_id") or "")
+    return f"[{severity}] {event_name} — {user} ({event_id})"
+
+
+def _format_rule_label(rule: Any) -> str:
+    """Normaliza a representação de uma regra CloudTrail violada."""
+    if isinstance(rule, dict):
+        for key in ("rule_name", "name", "id", "description"):
+            if rule.get(key):
+                return str(rule[key])
+        return json.dumps(rule, ensure_ascii=False)
+    return str(rule)
+
+
+def _sanitize_value(value: Any) -> Any:
+    """Remove caminhos locais sensíveis e credenciais de valores recursivamente."""
+    if isinstance(value, dict):
+        sanitized: Dict[str, Any] = {}
+        for key, item in value.items():
+            key_lower = str(key).lower()
+            if any(token in key_lower for token in _SENSITIVE_KEY_TOKENS):
+                sanitized[key] = "[REDACTED]"
+            else:
+                sanitized[key] = _sanitize_value(item)
+        return sanitized
+    if isinstance(value, list):
+        return [_sanitize_value(entry) for entry in value]
+    if isinstance(value, str) and _LOCAL_PATH_RE.match(value.strip()):
+        return "[PATH_REDACTED]"
+    return value
+
+
+def sanitize_payload_for_display(raw_payload: Any) -> Any:
+    """Prepara e sanitiza o payload técnico LGMS antes da exibição em st.json."""
+    parsed = raw_payload
+    if isinstance(raw_payload, str):
+        try:
+            parsed = json.loads(raw_payload)
+        except json.JSONDecodeError:
+            return {"raw_payload": _sanitize_value(raw_payload)}
+    return _sanitize_value(parsed)
 
 
 def _render_status_badge(label: str, is_ok: bool, ok_text: str, fail_text: str) -> None:
@@ -449,11 +663,250 @@ def render_charts_grid(stats: Dict[str, Any], logs: List[Dict[str, Any]]) -> Non
             )
 
 
+def render_executive_tab(
+    stats: Dict[str, Any],
+    health: Dict[str, Any],
+    logs_items: List[Dict[str, Any]],
+) -> None:
+    """Renderiza a aba Visão Executiva com os KPIs e gráficos da MAO-21."""
+    kpis = compute_kpis(stats=stats, health=health)
+    render_kpi_cards(kpis)
+
+    st.divider()
+
+    if kpis["total_logs"] == 0 and not logs_items:
+        st.info(
+            "Nenhum log foi processado ainda. Utilize a barra lateral para marcar "
+            "**Regenerar logs simulados** (se necessário) e clique em "
+            "**Executar Pipeline / Simular Logs** para iniciar a análise."
+        )
+        return
+
+    render_charts_grid(stats=stats, logs=logs_items)
+
+
+def _render_severity_badge(severity: str) -> None:
+    """Exibe badge colorido de severidade para o cabeçalho do alerta."""
+    level = (severity or "LOW").strip().upper()
+    color = SEVERITY_COLORS.get(level, "#6B7280")
+    safe_level = html.escape(level)
+    st.markdown(
+        f'<span style="background-color:{color};color:#FFFFFF;padding:4px 10px;'
+        f'border-radius:6px;font-weight:700;font-size:0.85rem;">{safe_level}</span>',
+        unsafe_allow_html=True,
+    )
+
+
+def render_anomaly_detail(api_base_url: str, detail: Dict[str, Any]) -> None:
+    """Renderiza cabeçalho, scores, explicação IA, botão de regeneração e JSON LGMS."""
+    event_id = str(detail.get("event_id") or "")
+    severity = str(detail.get("final_severity") or "LOW").upper()
+    event_name = str(detail.get("event_name") or "Desconhecido")
+    user_label = extract_user_label(detail.get("user_identity"))
+    source_ip = str(detail.get("source_ip") or "Desconhecido")
+    timestamp = str(detail.get("timestamp") or "-")
+    event_source = str(detail.get("event_source") or "-")
+    aws_region = str(detail.get("aws_region") or "-")
+
+    header_col, meta_col = st.columns([1, 5])
+    with header_col:
+        _render_severity_badge(severity)
+    with meta_col:
+        st.markdown(f"### {event_name}")
+        st.caption(
+            f"ID: `{event_id}` · Horário: `{timestamp}` · Usuário: `{user_label}` · "
+            f"IP: `{source_ip}` · Serviço: `{event_source}` · Região: `{aws_region}`"
+        )
+
+    zscore_val = detail.get("zscore_value")
+    zscore_display = str(0.0 if zscore_val is None else zscore_val)
+    iforest_val = detail.get("iforest_score")
+    iforest_display = str(0.0 if iforest_val is None else iforest_val)
+    rules = detail.get("cloudtrail_rules_triggered") or []
+    rule_labels = [_format_rule_label(rule) for rule in rules]
+
+    score_col1, score_col2, score_col3 = st.columns(3)
+    with score_col1:
+        st.metric(
+            "Z-Score",
+            zscore_display,
+            delta="Anômalo" if detail.get("is_zscore_anomaly") else "Normal",
+            delta_color="inverse" if detail.get("is_zscore_anomaly") else "off",
+        )
+    with score_col2:
+        st.metric(
+            "Isolation Forest Score",
+            iforest_display,
+            delta="Anômalo" if detail.get("is_iforest_anomaly") else "Normal",
+            delta_color="inverse" if detail.get("is_iforest_anomaly") else "off",
+        )
+    with score_col3:
+        st.metric("Regras CloudTrail Violadas", str(len(rule_labels)))
+
+    if rule_labels:
+        st.markdown("**Regras Violadas:** " + ", ".join(f"`{label}`" for label in rule_labels))
+    else:
+        st.caption("Nenhuma regra determinística CloudTrail violada para este evento.")
+
+    st.markdown("#### Explicação Contextualizada da IA")
+    with st.container(border=True):
+        ai_explanation = detail.get("ai_explanation")
+        if isinstance(ai_explanation, str) and ai_explanation.strip():
+            st.markdown(ai_explanation.strip())
+        else:
+            st.info(
+                "Este alerta ainda não possui explicação gerada pela IA. "
+                "Clique em **Regenerar Explicação com IA** abaixo para gerar uma análise."
+            )
+
+    if st.button(
+        "Regenerar Explicação com IA",
+        key=f"regenerate_explain_{event_id}",
+        type="primary",
+    ):
+        try:
+            with st.spinner("Gerando explicação com IA..."):
+                explain_result = trigger_anomaly_explanation(
+                    api_base_url=api_base_url,
+                    event_id=event_id,
+                )
+            source_raw = str(explain_result.get("source") or "").lower()
+            source_label = "Ollama" if source_raw == "ollama" else "Fallback Jinja2"
+            st.session_state["explain_success_msg"] = (
+                f"Explicação regenerada com sucesso via **{source_label}**."
+            )
+            fetch_anomaly_detail.clear()
+            fetch_filtered_anomalies.clear()
+            fetch_logs.clear()
+            st.rerun()
+        except httpx.HTTPStatusError as exc:
+            st.error(
+                f"Erro da API ao regenerar explicação ({exc.response.status_code}): "
+                f"{exc.response.text}"
+            )
+        except httpx.RequestError:
+            st.error(
+                f"Não foi possível conectar à API em {api_base_url} para regenerar a explicação."
+            )
+        except Exception as exc:
+            st.error(f"Falha ao regenerar explicação com IA: {exc}")
+
+    with st.expander("Ver JSON Original / Normalizado (LGMS)"):
+        raw_payload = detail.get("raw_normalized_json")
+        if raw_payload is None:
+            st.info("Payload normalizado LGMS não disponível para este alerta.")
+        else:
+            st.json(sanitize_payload_for_display(raw_payload))
+
+
+def render_investigation_tab(api_base_url: str) -> None:
+    """Renderiza a aba Investigação de Alertas & IA com filtros, tabela e detalhes."""
+    if "explain_success_msg" in st.session_state:
+        st.success(st.session_state.pop("explain_success_msg"))
+
+    st.subheader("Filtros de Anomalias")
+    col_sev, col_det, col_evt, col_user_ip = st.columns(4)
+    with col_sev:
+        selected_severity = st.selectbox(
+            "Severidade",
+            options=["Todas", *SEVERITY_ORDER],
+            index=0,
+            key="inv_filter_severity",
+        )
+    with col_det:
+        selected_detector = st.selectbox(
+            "Tipo de Detector",
+            options=["Todos", *DETECTOR_ORDER],
+            index=0,
+            key="inv_filter_detector",
+        )
+    with col_evt:
+        event_name_filter = st.text_input(
+            "Nome do Evento",
+            placeholder="Ex.: DeleteTrail",
+            key="inv_filter_event_name",
+        )
+    with col_user_ip:
+        user_or_ip_filter = st.text_input(
+            "Usuário ou IP",
+            placeholder="Ex.: mallory ou 198.51.100.7",
+            key="inv_filter_user_or_ip",
+        )
+
+    try:
+        anomalies_payload = fetch_filtered_anomalies(
+            api_base_url=api_base_url,
+            severity=selected_severity,
+            detector_label=selected_detector,
+            event_name=event_name_filter,
+            user_or_ip=user_or_ip_filter,
+            limit=200,
+            offset=0,
+        )
+    except httpx.HTTPStatusError as exc:
+        st.error(f"Erro ao filtrar anomalias ({exc.response.status_code}): {exc.response.text}")
+        return
+    except httpx.RequestError:
+        st.error(f"Não foi possível conectar à API em {api_base_url} para listar anomalias.")
+        return
+    except Exception as exc:
+        st.error(f"Falha ao consultar anomalias: {exc}")
+        return
+
+    anomalies = anomalies_payload.get("items") or []
+    total_found = int(anomalies_payload.get("total", len(anomalies)))
+    st.caption(f"Exibindo {len(anomalies)} de {total_found} anomalias encontradas.")
+
+    if not anomalies:
+        st.info("Nenhuma anomalia encontrada para os filtros selecionados.")
+        return
+
+    table_df = prepare_anomalies_table_df(anomalies)
+    st.dataframe(table_df, use_container_width=True, hide_index=True)
+
+    st.divider()
+    st.subheader("Detalhes do Alerta Selecionado")
+
+    anomaly_by_id = {
+        str(item["event_id"]): item for item in anomalies if item.get("event_id")
+    }
+    event_ids = list(anomaly_by_id.keys())
+    if not event_ids:
+        st.warning("As anomalias retornadas não possuem `event_id` válido.")
+        return
+
+    selected_event_id = st.selectbox(
+        "Selecione um alerta para investigar",
+        options=event_ids,
+        format_func=lambda eid: format_anomaly_option(anomaly_by_id[eid]),
+        key="inv_selected_event_id",
+    )
+
+    try:
+        detail = fetch_anomaly_detail(api_base_url=api_base_url, event_id=selected_event_id)
+    except httpx.HTTPStatusError as exc:
+        st.error(
+            f"Erro ao carregar detalhes do alerta ({exc.response.status_code}): "
+            f"{exc.response.text}"
+        )
+        return
+    except httpx.RequestError:
+        st.error(
+            f"Não foi possível conectar à API em {api_base_url} para consultar o alerta."
+        )
+        return
+    except Exception as exc:
+        st.error(f"Falha ao consultar detalhes do alerta: {exc}")
+        return
+
+    render_anomaly_detail(api_base_url=api_base_url, detail=detail)
+
+
 def main() -> None:
     """Ponto de entrada principal da aplicação Streamlit."""
     st.set_page_config(page_title="SecOps Assistido", layout="wide")
 
-    st.title("SecOps Assistido — Visão Executiva")
+    st.title("SecOps Assistido")
     st.caption(
         "Monitoramento híbrido de anomalias em logs AWS CloudTrail via Z-Score, "
         "Isolation Forest, CloudTrail Rules e IA local."
@@ -492,20 +945,14 @@ def main() -> None:
         return
 
     logs_items = logs_payload.get("items") or []
-    kpis = compute_kpis(stats=stats, health=health)
-    render_kpi_cards(kpis)
 
-    st.divider()
-
-    if kpis["total_logs"] == 0 and not logs_items:
-        st.info(
-            "Nenhum log foi processado ainda. Utilize a barra lateral para marcar "
-            "**Regenerar logs simulados** (se necessário) e clique em "
-            "**Executar Pipeline / Simular Logs** para iniciar a análise."
-        )
-        return
-
-    render_charts_grid(stats=stats, logs=logs_items)
+    tab_exec, tab_investigation = st.tabs(
+        ["Visão Executiva", "Investigação de Alertas & IA"]
+    )
+    with tab_exec:
+        render_executive_tab(stats=stats, health=health, logs_items=logs_items)
+    with tab_investigation:
+        render_investigation_tab(api_base_url=api_base_url)
 
 
 if __name__ == "__main__":
